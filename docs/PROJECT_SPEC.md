@@ -19,7 +19,7 @@ The product has four connected areas:
 3. **Knowledge Lab:** Search generations and documentation using embeddings; ask grounded questions about model notes and experiments.
 4. **Inference Lab:** Run controlled image and small text-model experiments, including a KV-cache comparison for autoregressive text decoding.
 
-The first release is for one local user. Public multi-user hosting, billing, model training, and claims of proprietary model weights are outside the initial scope.
+The first release supports local user accounts, login, and user-owned images. Public hosting, billing, model training, and claims of proprietary model weights are outside the initial scope.
 
 **Database decision (20 November 2026):** Build M2 with plain PostgreSQL only. Do not install or require pgvector for the image-generation MVP. Add pgvector and RAG in M4 after the image flow and job system are working; existing prompt and experiment records can be embedded then.
 
@@ -47,6 +47,8 @@ No speedup, retrieval score, or quality result may be claimed before it is measu
 3. One Python GPU worker claims the job, runs the model, and saves the PNG plus metrics.
 4. The UI shows queued, running, succeeded, or failed status and a gallery entry.
 5. The user opens two results side by side, with their settings and measurements.
+
+Before these steps, a user signs up or logs in. The API checks the session on each private request and returns only jobs and files owned by that user.
 
 ### Remove a background
 
@@ -92,9 +94,13 @@ Milestone 1 code exists in `services/ml-worker/generate.py`. Python 3.11, CUDA P
 - The saved PNG is black. The console reported `invalid value encountered in cast`, and the safety checker returned `nsfw_content_detected: [true]`.
 - The recorded `cold_load_ms` includes the first model download and retries, so it is **not** a comparable model-load benchmark.
 
-The first float32/model-offload attempt began on 20 November 2026 but failed before inference: the full-precision weight transfer ended with `ChunkedEncodingError` / `IncompleteRead`. No PNG was produced. This is a download failure, not evidence about float32 image quality. `hf_xet` was added to the worker environment for the next attempt.
+The first float32/model-offload attempt began on 20 November 2026 but failed before inference: the full-precision weight transfer ended with `ChunkedEncodingError` / `IncompleteRead`. No PNG was produced. This is a download failure, not evidence about float32 image quality. `hf_xet` was added to the worker environment for the retry.
 
-**Milestone 1 is not complete.** A black file is not a successful image-generation result. The warning and flag may have different causes; investigate without disabling the safety checker. Retry the same prompt and seed with `--dtype float32 --offload model` after the download is complete. This may download additional full-precision weights and run slowly. If that produces a valid image, record it as the working baseline and then isolate the FP16 failure. If it also fails, test another benign prompt/seed and inspect the safety result and pixel statistics. Keep each failed run and its metadata.
+The retry on 24 November 2026 completed and produced a visible, unflagged 512×512 lighthouse PNG. Its JSON reports 25 steps, seed 42, 875,301 ms inference, and peak CUDA allocated/reserved of 5,099.33 / 5,698.00 MiB. Its startup time includes the model download. The pinned Diffusers version warned that the `dtype` keyword was ignored, so this run alone did not verify the actual component precision. The worker has been changed back to `torch_dtype` and now records component dtypes. The memory counters exceed physical VRAM, so do not describe the run as fitting wholly in 4 GB of dedicated VRAM.
+
+The repeat on 24 November 2026 generated an unflagged, non-black PNG with the same SHA256 (`b737716d78dc729652aab6e8acae57449cb2d9cc1d8043cb84e8bb859722d7e8`). All three major pipeline components reported `torch.float32`. It took 519,614 ms for inference and 4,127 ms for cached model setup. The repeated image is byte-identical on this machine and software setup; cross-platform determinism is not promised. The same peak CUDA allocated/reserved counters were reported and need interpretation against Windows shared GPU memory before presenting a dedicated-VRAM claim.
+
+**M0 valid-image gate is met.** The FP16 black result remains an optimization issue to investigate without disabling the safety checker. Keep each failed run and its metadata.
 
 The existing script is a prototype. Before benchmark use, separate download time, model-load time, optional warmup time, inference time, and image-save time. Also mark a black or safety-filtered image as unsuitable for quality comparison rather than treating the presence of a PNG as success.
 
@@ -113,7 +119,9 @@ flowchart LR
     CPU --> DB
 ```
 
-NestJS owns validation, job creation, result URLs, and database access for the web app. Python owns model loading, inference, segmentation, embedding, and profiling. GPU work never runs inside an HTTP request. Use a PostgreSQL job table and transactional claiming for the local MVP; add a separate broker only if measured throughput or operations require it.
+NestJS owns signup/login, session checks, validation, job creation, result URLs, and database access for the web app. Python owns model loading, inference, segmentation, embedding, and profiling. GPU work never runs inside an HTTP request. Use a PostgreSQL job table and transactional claiming for the local MVP; add a separate broker only if measured throughput or operations require it.
+
+Passwords are hashed with Argon2id. The browser receives an opaque, revocable session cookie; PostgreSQL stores a hash of its token, expiry, and revocation time. Production cookies use `HttpOnly`, `Secure`, and `SameSite`; local HTTP development needs an explicit cookie setting. Never log passwords or raw session tokens. Rate-limit registration and login. All private database queries use the authenticated user ID from the session, not a user ID supplied by the browser.
 
 The UI should show only supported options returned by `/api/v1/system/capabilities`. The browser receives job IDs and safe image URLs, not raw filesystem paths. The worker should recover stale running jobs after restart and write structured error codes for OOM, model-load, timeout, safety-filter, and invalid-output cases.
 
@@ -161,6 +169,17 @@ Keep image, retrieval, and text inference dependencies in separate Python enviro
 
 Image request: prompt 1–500 characters; optional negative prompt, seed, steps, guidance, width/height, scheduler, precision, and memory mode. All options are allowlisted and bounded by verified capabilities. A job has `queued → running → succeeded | failed` states with timestamps. A safety-filtered or numerically invalid image has an explicit outcome; it is not silently counted as a valid success.
 
+### Accounts and sessions
+
+| Method | Route | Purpose |
+|---|---|---|
+| `POST` | `/api/v1/auth/signup` | Create an account after validation |
+| `POST` | `/api/v1/auth/login` | Verify credentials and create a session |
+| `POST` | `/api/v1/auth/logout` | Revoke the current session |
+| `GET` | `/api/v1/auth/me` | Return the current account profile |
+
+Private generation, gallery, cutout, and benchmark endpoints require a valid session. A user can never fetch another user's job or image by changing an ID in the URL. The public health endpoint reveals no account data.
+
 ### Cutout Lab
 
 | Method | Route | Purpose |
@@ -191,7 +210,10 @@ Use the embedding model's tokenizer and test a starting chunk size around 180 to
 ## 9. Logical data model
 
 - `models`: model ID, revision, task, license note, validated capabilities.
-- `jobs`: UUID, type, status, validated request, timestamps, attempt count, error code, worker heartbeat.
+- `users`: UUID, normalized email, Argon2id password hash, display name, timestamps.
+- `sessions`: UUID, user ID, opaque token hash, expiry, last seen, revocation time.
+- `login_events`: user ID when known, outcome, timestamp; never raw credentials.
+- `jobs`: UUID, owner user ID, type, status, validated request, timestamps, attempt count, error code, worker heartbeat.
 - `images`: UUID, source job, storage key, role (`generated`, `original`, `cutout`, `mask`), dimensions, format, SHA256.
 - `generation_metrics`: job ID, model/precision/scheduler, load, warmup, inference and save times, CUDA peak allocated/reserved, versions, GPU.
 - `benchmark_runs`: UUID, workload, fixed dataset version, configurations, repeats, status.
@@ -223,13 +245,14 @@ Use the same text model, tokenizer, prompts, output-token limits, device, dtype,
 
 ## 11. UI screens
 
-1. **Generate:** prompt and verified settings, queued/running/result/error states.
-2. **Gallery:** images, metadata, semantic search, repeat button.
-3. **Cutout:** upload/select image, checkerboard preview, original/cutout/mask downloads.
-4. **Compare:** two images and their exact settings/measurements side by side.
-5. **Knowledge:** documents, source search, cited answers, explicit no-evidence response.
-6. **Benchmarks:** image, retrieval, and text experiment setup; tables/charts and CSV export.
-7. **System:** installed models, GPU, worker health, storage usage, and supported modes.
+1. **Signup/Login:** account creation, login, logout, and session state.
+2. **Generate:** prompt and verified settings, queued/running/result/error states.
+3. **Gallery:** images, metadata, semantic search, repeat button.
+4. **Cutout:** upload/select image, checkerboard preview, original/cutout/mask downloads.
+5. **Compare:** two images and their exact settings/measurements side by side.
+6. **Knowledge:** documents, source search, cited answers, explicit no-evidence response.
+7. **Benchmarks:** image, retrieval, and text experiment setup; tables/charts and CSV export.
+8. **System:** installed models, GPU, worker health, storage usage, and supported modes.
 
 The UI must not display fabricated progress percentages or benchmark numbers. If step callbacks are available, show approximate progress and label it as such.
 
@@ -239,7 +262,7 @@ The UI must not display fabricated progress percentages or benchmark numbers. If
 |---|---|---|
 | **M0 — Valid image** | Diagnose FP16 black result; establish working configuration | Non-black, unflagged PNG and JSON on GTX 1650; second run recorded |
 | **M1 — Measured image worker** | Reliable CLI, separated timings, repeatable benchmark harness | Controlled image runs with raw samples and OOM handling |
-| **M2 — Full stack core** | Plain PostgreSQL jobs, Python worker, NestJS API, Next.js generate/gallery | End-to-end prompt-to-image flow and Postman tests; no vector extension required |
+| **M2 — Full stack core** | Plain PostgreSQL users/sessions/jobs, Python worker, NestJS API, Next.js signup/login/generate/gallery | End-to-end private prompt-to-image flow, ownership tests, and Postman tests; no vector extension required |
 | **M3 — Cutout Lab** | CPU segmentation service and UI | Original + transparent PNG + mask; edge review and file validation |
 | **M4 — Knowledge Lab** | Embeddings, pgvector search, grounded Q&A | Labeled recall@5/latency report, citations, deletion test |
 | **M5 — KV-cache Lab** | Small text model and cache benchmark | Repeated cache-on/off results with token counts and memory |

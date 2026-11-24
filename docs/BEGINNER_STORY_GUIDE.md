@@ -21,6 +21,7 @@ You do **not** train Stable Diffusion from the beginning. We use pretrained mode
 | Visitor's counter | Next.js web app | Accepts prompts, shows progress and images |
 | Front desk clerk | NestJS API | Checks requests, creates jobs, returns results |
 | Job book | PostgreSQL | Remembers every job, status, settings, and measurement |
+| Membership desk | NestJS auth + PostgreSQL | Creates accounts and checks who owns each job |
 | Image specialist | Python GPU worker | Loads Stable Diffusion and generates images |
 | Cutout specialist | Python CPU worker | Removes image backgrounds |
 | Image machine | GTX 1650 GPU | Runs the heavy image calculations |
@@ -28,6 +29,8 @@ You do **not** train Stable Diffusion from the beginning. We use pretrained mode
 | Lab notebook | Benchmark records | Lets us compare settings fairly |
 
 **What exists today:** an early Python image specialist (`services/ml-worker/generate.py`) and the project documentation. The web counter, API clerk, database job book, and other specialists are planned work. The first image run completed calculations but returned a black picture, so the image feature is not yet validated.
+
+When we build the frontend, a visitor first creates an account or logs in. The membership desk gives their browser a session cookie. PostgreSQL stores the account, a password **hash** (not the password), a revocable session record, and a small login history. Each image job has an owner. If another user guesses a job ID, the API still refuses to show that job because ownership is checked on the server.
 
 ## Chapter 1 — A visitor asks for an image
 
@@ -77,7 +80,7 @@ We change **one setting at a time** in experiments. If we change precision, size
 
 Your first 512×512 run used seed 42, 25 steps, FP16, and no offloading. It finished in about **125 seconds**. PyTorch reported a peak of about **3,257 MiB allocated** and **3,524 MiB reserved** on the GTX 1650. The model downloaded successfully, but the PNG was black. The run also showed a numerical warning and a safety-checker flag.
 
-The next float32 attempt did not test image quality: its full-precision weight download broke before inference. The worker now has the Xet downloader installed, and the same diagnostic can be retried. A download failure and a model failure are different problems, so we record them separately.
+The next float32 attempt did not test image quality: its full-precision weight download broke before inference. The worker now has the Xet downloader installed. A retry produced a visible lighthouse image, but it was slow and the library ignored the newer `dtype` setting. We fixed that setting and repeated the run. The second image has exactly the same file hash, and its main model parts report float32. A download failure and a model failure are different problems, so we record them separately.
 
 This is a useful engineering observation, **not yet a successful image feature**. A PNG file can exist even when its contents are unusable. We need to inspect pixels and the safety result as well as the job status. We cannot say from one run whether the cause was FP16 behavior, a safety false positive, or another issue.
 
@@ -143,7 +146,7 @@ The dashboard will show a short summary, side-by-side outputs, and raw CSV/JSON.
 |---|---|---|
 | **M0: Valid image** | Diagnose the black result and make one valid PNG | Prompt, seed, steps, precision, safety checker, VRAM |
 | **M1: Reliable worker** | Improve timing and failure records; repeat runs | Cold versus warm time; allocated versus reserved GPU memory |
-| **M2: Full stack** | Add PostgreSQL jobs, NestJS API, Next.js UI | Why the API queues work and why the GPU runs in a worker |
+| **M2: Full stack** | Add PostgreSQL accounts/jobs, NestJS API, Next.js signup/login and image UI | Sessions, job ownership, why the API queues work and why the GPU runs in a worker |
 | **M3: Cutout Lab** | Add upload, mask, transparent PNG, comparison | Segmentation mask and alpha channel |
 | **M4: Knowledge Lab** | Add embeddings, search, cited answers, tests | Tokenization, vectors, pgvector, RAG, recall@5 |
 | **M5: KV-cache Lab** | Add small text model and controlled cache comparison | Autoregressive decoding, cache, tokens/second |

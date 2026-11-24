@@ -14,6 +14,7 @@ from pathlib import Path
 
 
 DEFAULT_MODEL = "stable-diffusion-v1-5/stable-diffusion-v1-5"
+DEFAULT_MODEL_REVISION = "451f4fe16113bff5a5d2269ed5ad43b0592e9a14"
 
 
 def arguments() -> argparse.Namespace:
@@ -29,6 +30,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--offload", choices=("none", "model"), default="none")
     parser.add_argument("--warmup", action="store_true", help="Run one untimed generation first")
     parser.add_argument("--model-id", default=DEFAULT_MODEL)
+    parser.add_argument("--model-revision", default=None, help="Hugging Face commit hash or tag")
     parser.add_argument("--output-dir", type=Path, default=Path(__file__).resolve().parent / "outputs")
     args = parser.parse_args()
     if not 1 <= len(args.prompt.strip()) <= 500:
@@ -43,6 +45,8 @@ def arguments() -> argparse.Namespace:
         value = getattr(args, name)
         if not 256 <= value <= 768 or value % 8:
             parser.error(f"--{name} must be a multiple of 8 between 256 and 768")
+    if args.model_id == DEFAULT_MODEL and args.model_revision is None:
+        args.model_revision = DEFAULT_MODEL_REVISION
     return args
 
 
@@ -76,6 +80,7 @@ def main() -> int:
         "width": args.width,
         "height": args.height,
         "model_id": args.model_id,
+        "model_revision": args.model_revision,
         "dtype": args.dtype,
         "offload": args.offload,
         "warmup": args.warmup,
@@ -101,7 +106,10 @@ def main() -> int:
 
     try:
         load_start = time.perf_counter()
-        load_options = {"dtype": dtype, "use_safetensors": True}
+        # Diffusers 0.35.2 uses torch_dtype here; its newer dtype keyword is ignored.
+        load_options = {"torch_dtype": dtype, "use_safetensors": True}
+        if args.model_revision is not None:
+            load_options["revision"] = args.model_revision
         if args.dtype == "float16":
             load_options["variant"] = "fp16"
         pipe = StableDiffusionPipeline.from_pretrained(args.model_id, **load_options)
@@ -112,8 +120,14 @@ def main() -> int:
         else:
             pipe.to("cuda")
         torch.cuda.synchronize()
-        metadata["cold_load_ms"] = round((time.perf_counter() - load_start) * 1000, 2)
-        metadata["model_revision"] = getattr(pipe.config, "_commit_hash", None)
+        metadata["model_setup_ms"] = round((time.perf_counter() - load_start) * 1000, 2)
+        metadata["model_setup_may_include_download"] = True
+        metadata["model_revision"] = args.model_revision or getattr(pipe.config, "_commit_hash", None)
+        metadata["actual_component_dtypes"] = {
+            "unet": str(pipe.unet.dtype),
+            "vae": str(pipe.vae.dtype),
+            "text_encoder": str(pipe.text_encoder.dtype),
+        }
 
         def generate():
             # Recreate the CPU generator so warmup does not consume the measured seed.
@@ -130,8 +144,10 @@ def main() -> int:
 
         if args.warmup:
             print("Running untimed warmup...", flush=True)
+            warmup_start = time.perf_counter()
             generate()
             torch.cuda.synchronize()
+            metadata["warmup_ms"] = round((time.perf_counter() - warmup_start) * 1000, 2)
         torch.cuda.reset_peak_memory_stats()
         started = time.perf_counter()
         with warnings.catch_warnings(record=True) as captured_warnings:
@@ -144,7 +160,9 @@ def main() -> int:
         metadata["nsfw_content_detected"] = result.nsfw_content_detected
         metadata["runtime_warnings"] = [str(w.message) for w in captured_warnings]
         image = result.images[0]
+        save_start = time.perf_counter()
         image.save(image_path)
+        metadata["image_save_ms"] = round((time.perf_counter() - save_start) * 1000, 2)
         metadata["image_sha256"] = hashlib.sha256(image_path.read_bytes()).hexdigest()
         metadata["image_file"] = image_path.name
         extrema = image.convert("RGB").getextrema()
